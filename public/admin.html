@@ -1,0 +1,177 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Admin | Guess the Bride</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#fbf7f2;color:#3e3035;font-family:"DM Sans",sans-serif}
+main{max-width:950px;margin:auto;padding:35px 18px}
+h1,h2{font-family:"Playfair Display",serif;font-weight:500}
+h1{font-size:40px;color:#b76e79}
+.panel{background:#fffdfa;border:1px solid #e9dbd8;border-radius:12px;padding:25px;margin:20px 0}
+input{width:100%;border:1px solid #e9dbd8;background:white;border-radius:7px;padding:12px;font:inherit}
+button{background:#b76e79;color:white;border:0;border-radius:7px;padding:12px 19px;font:600 13px "DM Sans",sans-serif;cursor:pointer}
+button:disabled{opacity:.5}
+button.secondary{background:#73646a}
+button.danger{background:#9e454d}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
+.stats{display:flex;gap:30px;flex-wrap:wrap}
+.stats strong{font-size:30px;color:#b76e79;display:block}
+.candidate{display:grid;grid-template-columns:100px 1fr;gap:18px;align-items:start;padding:18px 0;border-bottom:1px solid #e9dbd8}
+.candidate img{width:100px;height:130px;object-fit:cover;border-radius:7px;background:#eadbd9}
+.fields{display:grid;gap:9px}
+.fields label{font-size:12px;font-weight:700}
+.votes{font-size:13px;color:#b76e79;font-weight:700}
+#status{min-height:22px;color:#b76e79;font-weight:600}
+[hidden]{display:none!important}
+@media(max-width:500px){.candidate{grid-template-columns:1fr}.candidate img{width:90px;height:110px}}
+</style>
+</head>
+<body>
+<main>
+<h1>Bridal Edit <span style="color:#8f7c81">/ Admin</span></h1>
+
+<section id="login" class="panel">
+  <h2>Welcome back</h2>
+  <p>Enter the administrator password to continue.</p>
+  <input id="password" type="password" placeholder="Admin password">
+  <div style="margin-top:15px"><button id="enter">Sign in</button></div>
+</section>
+
+<section id="dashboard" hidden>
+  <div class="panel">
+    <div class="stats">
+      <div><strong id="total">0</strong>Total votes</div>
+      <div><strong id="visitors">0</strong>Visitors</div>
+    </div>
+    <div class="toolbar">
+      <button id="refresh">Refresh</button>
+      <button id="export">Export CSV</button>
+      <button id="reset" class="danger">Reset votes</button>
+    </div>
+    <p id="status" role="status"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Manage candidates</h2>
+    <div id="list"></div>
+  </div>
+</section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let password = "";
+
+function headers(){
+  return {"x-admin":password,"Content-Type":"application/json"};
+}
+function status(text){$("status").textContent=text;}
+
+async function load(first=false){
+  try{
+    const r=await fetch("/api/admin",{headers:headers(),cache:"no-store"});
+    const data=await r.json();
+    if(!r.ok) throw new Error(data.error||"Access denied");
+    $("login").hidden=true;
+    $("dashboard").hidden=false;
+    $("total").textContent=data.total;
+    $("visitors").textContent=data.visitors;
+    render(data.candidates);
+    status("");
+  }catch(e){
+    if(first) alert(e.message);
+    else status(e.message);
+  }
+}
+
+function render(candidates){
+  const list=$("list");
+  list.replaceChildren();
+  const sorted=[...candidates].sort((a,b)=>a.n-b.n);
+
+  for(const c of sorted){
+    const row=document.createElement("div");
+    row.className="candidate";
+
+    const img=document.createElement("img");
+    img.src=c.photo;
+    img.alt=c.name;
+
+    const fields=document.createElement("div");
+    fields.className="fields";
+
+    const votes=document.createElement("div");
+    votes.className="votes";
+    votes.textContent=c.votes+" votes";
+
+    const nameLabel=document.createElement("label");
+    nameLabel.textContent="Candidate name";
+    const name=document.createElement("input");
+    name.value=c.name;
+
+    const photoLabel=document.createElement("label");
+    photoLabel.textContent="Photo path";
+    const photo=document.createElement("input");
+    photo.value=c.photo;
+
+    const save=document.createElement("button");
+    save.textContent="Save changes";
+    save.onclick=async()=>{
+      save.disabled=true;
+      try{
+        const r=await fetch("/api/admin/candidate/"+encodeURIComponent(c.id),{
+          method:"PUT",headers:headers(),
+          body:JSON.stringify({name:name.value,photo:photo.value})
+        });
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.error||"Save failed");
+        img.src=photo.value;
+        status(c.name+" updated successfully");
+      }catch(e){status(e.message)}
+      finally{save.disabled=false}
+    };
+
+    fields.append(votes,nameLabel,name,photoLabel,photo,save);
+    row.append(img,fields);
+    list.appendChild(row);
+  }
+}
+
+$("enter").onclick=()=>{
+  password=$("password").value;
+  load(true);
+};
+$("password").onkeydown=e=>{
+  if(e.key==="Enter") $("enter").click();
+};
+$("refresh").onclick=()=>load();
+$("reset").onclick=async()=>{
+  if(prompt("Type RESET to delete all votes")!=="RESET")return;
+  const r=await fetch("/api/admin/reset",{
+    method:"POST",headers:headers()
+  });
+  if(!r.ok)return status("Reset failed");
+  await load();
+  status("Votes reset successfully");
+};
+$("export").onclick=async()=>{
+  try{
+    const r=await fetch("/api/admin/export",{headers:headers()});
+    if(!r.ok)throw new Error("Export failed");
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;a.download="bride-results.csv";a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(e){status(e.message)}
+};
+</script>
+</body>
+</html>
