@@ -5,6 +5,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { neon } = require("@neondatabase/serverless");
 
 const app = express();
 
@@ -13,16 +14,13 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "20kb" }));
 
 const PORT = Number(process.env.PORT || 3000);
-
 const PUBLIC = path.join(__dirname, "public");
-const DATA = process.env.DATA_DIR || path.join(__dirname, "data");
-const DB_PATH = path.join(DATA, "db.json");
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
-const SECRET =
-  process.env.VOTE_SECRET ||
-  process.env.SALT ||
-  "change-me";
+const SECRET = process.env.VOTE_SECRET || process.env.SALT || "change-me";
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const sql = DATABASE_URL ? neon(DATABASE_URL) : null;
 
 const defaults = [
   ["nadia", "Nadia"],
@@ -40,72 +38,64 @@ const defaults = [
   id,
   name,
   n: i + 1,
-  photo: `/photos/${id}.jpeg`,
-  label: "",
-  clue: ""
+  photo: `/photos/${id}.jpeg`
 }));
 
-// Database initialization
-// NOTE: Local JSON storage is not persistent on Vercel.
+// Initialize persistent database
+let initPromise;
 
-const IS_VERCEL = Boolean(process.env.VERCEL);
+async function initializeDatabase() {
+  if (!sql) {
+    throw new Error("DATABASE_URL is missing.");
+  }
 
-if (!IS_VERCEL) {
-  fs.mkdirSync(DATA, { recursive: true });
-}
+  await sql`
+    CREATE TABLE IF NOT EXISTS candidates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      n INTEGER NOT NULL,
+      photo TEXT NOT NULL
+    )
+  `;
 
-let db;
+  await sql`
+    CREATE TABLE IF NOT EXISTS votes (
+      dev TEXT PRIMARY KEY,
+      cid TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      t BIGINT NOT NULL
+    )
+  `;
 
-if (fs.existsSync(DB_PATH)) {
-  db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-} else {
-  db = {
-    candidates: [],
-    votes: [],
-    visitors: []
-  };
-}
+  await sql`
+    CREATE TABLE IF NOT EXISTS visitors (
+      dev TEXT PRIMARY KEY
+    )
+  `;
 
-if (!Array.isArray(db.candidates)) db.candidates = [];
-if (!Array.isArray(db.votes)) db.votes = [];
-if (!Array.isArray(db.visitors)) db.visitors = [];
-
-for (const item of defaults) {
-  const existing = db.candidates.find(
-    c => c.id === item.id
-  );
-
-  if (!existing) {
-    db.candidates.push({ ...item });
-  } else {
-    if (!existing.name) existing.name = item.name;
-    if (!existing.photo) existing.photo = item.photo;
-
-    existing.n = item.n;
-    existing.label = "";
-    existing.clue = "";
+  for (const candidate of defaults) {
+    await sql`
+      INSERT INTO candidates (id, name, n, photo)
+      VALUES (
+        ${candidate.id},
+        ${candidate.name},
+        ${candidate.n},
+        ${candidate.photo}
+      )
+      ON CONFLICT (id) DO NOTHING
+    `;
   }
 }
 
-function save() {
-  if (IS_VERCEL) {
-    throw new Error(
-      "Persistent database required on Vercel. Configure external storage before enabling voting."
-    );
+function ready() {
+  if (!initPromise) {
+    initPromise = initializeDatabase().catch(error => {
+      initPromise = null;
+      throw error;
+    });
   }
 
-  const tmp = DB_PATH + ".tmp";
-
-  fs.writeFileSync(
-    tmp,
-    JSON.stringify(db, null, 2)
-  );
-
-  fs.renameSync(tmp, DB_PATH);
-}
-
-if (!IS_VERCEL) {
-  save();
+  return initPromise;
 }
 
 function hash(value) {
@@ -118,24 +108,17 @@ function hash(value) {
 
 function cookie(req, name) {
   const match = (req.headers.cookie || "").match(
-    new RegExp(
-      "(?:^|;\\s*)" + name + "=([^;]+)"
-    )
+    new RegExp("(?:^|;\\s*)" + name + "=([^;]+)")
   );
 
-  return match
-    ? decodeURIComponent(match[1])
-    : null;
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
-// Device identification
+// Identify voting device
 app.use((req, res, next) => {
   let device = cookie(req, "gtb");
 
-  if (
-    !device ||
-    !/^[a-f0-9-]{36}$/i.test(device)
-  ) {
+  if (!device || !/^[a-f0-9-]{36}$/i.test(device)) {
     device = crypto.randomUUID();
 
     const secure =
@@ -152,92 +135,94 @@ app.use((req, res, next) => {
 
   req.device = device;
   req.network = hash(req.ip || "unknown");
-
   next();
 });
 
-function ownVote(req) {
-  return db.votes.find(
-    v => v.dev === req.device
-  );
+// Async error wrapper
+function route(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
 }
 
-function publicState(req) {
-  const counts = Object.create(null);
+// Get state from Neon
+async function publicState(req) {
+  await ready();
 
-  for (const v of db.votes) {
-    counts[v.cid] = (counts[v.cid] || 0) + 1;
-  }
+  const [candidates, counts, totals, own] = await Promise.all([
+    sql`
+      SELECT id, name, n, photo
+      FROM candidates
+      ORDER BY n ASC
+    `,
+    sql`
+      SELECT cid, COUNT(*)::integer AS votes
+      FROM votes
+      GROUP BY cid
+    `,
+    sql`
+      SELECT COUNT(*)::integer AS total
+      FROM votes
+    `,
+    sql`
+      SELECT cid
+      FROM votes
+      WHERE dev = ${req.device}
+      LIMIT 1
+    `
+  ]);
 
-  const vote = ownVote(req);
+  const voteCounts = new Map(
+    counts.map(row => [row.cid, Number(row.votes)])
+  );
 
-  const candidates = defaults.map(def => {
-    const c = db.candidates.find(
-      x => x.id === def.id
-    ) || def;
-
-    return {
-      id: c.id,
-      name: c.name,
-      n: def.n,
-      photo: c.photo,
-      votes: counts[c.id] || 0
-    };
-  });
+  const candidateList = candidates.map(c => ({
+    id: c.id,
+    name: c.name,
+    n: Number(c.n),
+    photo: c.photo,
+    votes: voteCounts.get(c.id) || 0
+  }));
 
   return {
-    candidates,
-    total: db.votes.length,
-    voted: Boolean(vote),
-    myVote: vote ? vote.cid : null
+    candidates: candidateList,
+    total: Number(totals[0]?.total || 0),
+    voted: own.length > 0,
+    myVote: own[0]?.cid || null
   };
 }
 
 // Homepage
 app.get("/", (req, res) => {
-  const file = path.join(
-    PUBLIC,
-    "index.html"
-  );
+  const file = path.join(PUBLIC, "index.html");
+  const html = fs.readFileSync(file, "utf8");
 
-  const html = fs.readFileSync(
-    file,
-    "utf8"
-  );
-
-  const base =
-    `${req.protocol}://${req.get("host")}`;
+  const base = `${req.protocol}://${req.get("host")}`;
 
   res
     .type("html")
     .set("Cache-Control", "no-store")
-    .send(
-      html.replace(/__BASE__/g, base)
-    );
+    .send(html.replace(/__BASE__/g, base));
 });
 
-// Public state
-app.get("/api/state", (req, res) => {
-  if (!db.visitors.includes(req.device)) {
-    if (!IS_VERCEL) {
-      db.visitors.push(req.device);
-      save();
-    }
-  }
+// Public state and visitor tracking
+app.get("/api/state", route(async (req, res) => {
+  await ready();
+
+  await sql`
+    INSERT INTO visitors (dev)
+    VALUES (${req.device})
+    ON CONFLICT (dev) DO NOTHING
+  `;
 
   res
     .set("Cache-Control", "no-store")
-    .json(publicState(req));
-});
+    .json(await publicState(req));
+}));
 
-// Voting
-app.post("/api/vote", (req, res) => {
-  if (IS_VERCEL) {
-    return res.status(503).json({
-      error:
-        "Voting is unavailable until a persistent database is configured."
-    });
-  }
+// Vote or change existing vote
+app.post("/api/vote", route(async (req, res) => {
+  await ready();
 
   const id = req.body?.id;
 
@@ -247,72 +232,73 @@ app.post("/api/vote", (req, res) => {
     });
   }
 
-  const existing = ownVote(req);
+  const existing = await sql`
+    SELECT cid
+    FROM votes
+    WHERE dev = ${req.device}
+    LIMIT 1
+  `;
 
-  if (existing) {
-    // Changing a vote does not increase total votes.
-    existing.cid = id;
-    existing.t = Date.now();
-
-    save();
+  if (existing.length) {
+    await sql`
+      UPDATE votes
+      SET cid = ${id}, t = ${Date.now()}
+      WHERE dev = ${req.device}
+    `;
 
     return res.json({
       ok: true,
       changed: true,
-      ...publicState(req)
+      ...await publicState(req)
     });
   }
 
-  const networkVotes = db.votes.filter(
-    v => v.ip === req.network
-  ).length;
+  const networkVotes = await sql`
+    SELECT COUNT(*)::integer AS count
+    FROM votes
+    WHERE ip = ${req.network}
+  `;
 
-  if (networkVotes >= 3) {
+  if (Number(networkVotes[0].count) >= 3) {
     return res.status(429).json({
-      error:
-        "Voting limit reached for this network."
+      error: "Voting limit reached for this network."
     });
   }
 
-  db.votes.push({
-    cid: id,
-    dev: req.device,
-    ip: req.network,
-    t: Date.now()
-  });
-
-  save();
+  // A unique device ID prevents duplicate rows.
+  const inserted = await sql`
+    INSERT INTO votes (dev, cid, ip, t)
+    VALUES (
+      ${req.device},
+      ${id},
+      ${req.network},
+      ${Date.now()}
+    )
+    ON CONFLICT (dev) DO NOTHING
+    RETURNING dev
+  `;
 
   res.json({
     ok: true,
-    changed: false,
-    ...publicState(req)
+    changed: inserted.length === 0,
+    ...await publicState(req)
   });
-});
+}));
 
 // Admin authentication
 function adminAuth(req, res, next) {
   if (!ADMIN_PASSWORD) {
     return res.status(503).json({
-      error:
-        "Set ADMIN_PASSWORD on the server."
+      error: "Set ADMIN_PASSWORD on the server."
     });
   }
 
-  const provided = Buffer.from(
-    req.get("x-admin") || ""
-  );
-
-  const expected = Buffer.from(
-    ADMIN_PASSWORD
-  );
+  const provided = Buffer.from(req.get("x-admin") || "");
+  const expected = Buffer.from(ADMIN_PASSWORD);
 
   if (
     provided.length !== expected.length ||
-    !crypto.timingSafeEqual(
-      provided,
-      expected
-    )
+    !crypto.timingSafeEqual(provided, expected)
   ) {
     return res.status(401).json({
       error: "Wrong password."
@@ -322,50 +308,38 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// Admin state
-app.get(
-  "/api/admin",
-  adminAuth,
-  (req, res) => {
-    res.json({
-      ...publicState(req),
-      visitors: db.visitors.length
-    });
-  }
-);
+// Admin dashboard state
+app.get("/api/admin", adminAuth, route(async (req, res) => {
+  await ready();
 
-// Update candidate
+  const visitors = await sql`
+    SELECT COUNT(*)::integer AS count
+    FROM visitors
+  `;
+
+  res.json({
+    ...await publicState(req),
+    visitors: Number(visitors[0].count)
+  });
+}));
+
+// Update candidate details
 app.put(
   "/api/admin/candidate/:id",
   adminAuth,
-  (req, res) => {
-    if (IS_VERCEL) {
-      return res.status(503).json({
-        error:
-          "Editing requires a persistent database on Vercel."
-      });
-    }
+  route(async (req, res) => {
+    await ready();
 
-    const c = db.candidates.find(
-      x => x.id === req.params.id
-    );
+    const id = req.params.id;
 
-    if (
-      !c ||
-      !defaults.some(x => x.id === c.id)
-    ) {
+    if (!defaults.some(c => c.id === id)) {
       return res.status(404).json({
         error: "Not found."
       });
     }
 
-    const name = String(
-      req.body?.name || ""
-    ).trim();
-
-    const photo = String(
-      req.body?.photo || ""
-    ).trim();
+    const name = String(req.body?.name || "").trim();
+    const photo = String(req.body?.photo || "").trim();
 
     if (!name || name.length > 100) {
       return res.status(400).json({
@@ -374,72 +348,66 @@ app.put(
     }
 
     if (
-      !photo.startsWith("/photos/") ||
-      photo.includes("..") ||
-      photo.includes("\\") ||
-      photo.length > 300
+      !/^\/photos\/[a-zA-Z0-9._-]+\.(jpeg|jpg|png|webp)$/i.test(photo) ||
+      photo.includes("..")
     ) {
       return res.status(400).json({
-        error:
-          "Use a photo path such as /photos/nadia.jpeg"
+        error: "Use a valid /photos/ image path."
       });
     }
 
-    c.name = name;
-    c.photo = photo;
-    c.label = "";
-    c.clue = "";
+    const result = await sql`
+      UPDATE candidates
+      SET name = ${name}, photo = ${photo}
+      WHERE id = ${id}
+      RETURNING id, name, n, photo
+    `;
 
-    save();
+    if (!result.length) {
+      return res.status(404).json({
+        error: "Not found."
+      });
+    }
 
     res.json({
       ok: true,
-      candidate: c
+      candidate: {
+        ...result[0],
+        label: "",
+        clue: ""
+      }
     });
-  }
+  })
 );
 
-// Reset votes
+// Reset all votes
 app.post(
   "/api/admin/reset",
   adminAuth,
-  (req, res) => {
-    if (IS_VERCEL) {
-      return res.status(503).json({
-        error:
-          "Reset requires a persistent database on Vercel."
-      });
-    }
+  route(async (req, res) => {
+    await ready();
 
-    db.votes = [];
+    await sql`DELETE FROM votes`;
 
-    save();
-
-    res.json({
-      ok: true
-    });
-  }
+    res.json({ ok: true });
+  })
 );
 
 // Export results
 app.get(
   "/api/admin/export",
   adminAuth,
-  (req, res) => {
-    const rows = publicState(req)
-      .candidates
-      .sort(
-        (a, b) => b.votes - a.votes
-      );
+  route(async (req, res) => {
+    const state = await publicState(req);
+
+    const rows = state.candidates.sort(
+      (a, b) => b.votes - a.votes
+    );
 
     const csv = [
       "rank,name,votes",
-      ...rows.map(
-        (c, i) =>
-          `${i + 1},"${c.name.replace(
-            /"/g,
-            '""'
-          )}",${c.votes}`
+      ...rows.map((c, i) =>
+        `${i + 1},"${c.name.replace(/"/g, '""')}",${c.votes}`
       )
     ].join("\r\n");
 
@@ -450,56 +418,42 @@ app.get(
         'attachment; filename="bride-results.csv"'
       )
       .send(csv);
-  }
+  })
 );
 
 // Admin page
 app.get("/admin", (req, res) => {
-  res.sendFile(
-    path.join(PUBLIC, "admin.html")
-  );
+  res.sendFile(path.join(PUBLIC, "admin.html"));
 });
 
 // Static assets
-app.use(
-  express.static(PUBLIC, {
-    index: false,
-    setHeaders: (res, filePath) => {
-      if (
-        /\.(jpg|jpeg|png|webp|gif)$/i.test(
-          filePath
-        )
-      ) {
-        res.setHeader(
-          "Cache-Control",
-          "no-store, no-cache, must-revalidate"
-        );
-
-        res.setHeader(
-          "Pragma",
-          "no-cache"
-        );
-
-        res.setHeader(
-          "Expires",
-          "0"
-        );
-      }
+app.use(express.static(PUBLIC, {
+  index: false,
+  setHeaders: (res, filePath) => {
+    if (/\.(jpg|jpeg|png|webp|gif)$/i.test(filePath)) {
+      res.setHeader("Cache-Control", "no-store");
     }
-  })
-);
+  }
+}));
 
 // 404
 app.use((req, res) => {
   res.status(404).send("Not found");
 });
 
-// Local development + Vercel support
+// Error handling
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+
+  res.status(500).json({
+    error: "Server error. Please try again."
+  });
+});
+
+// Run locally and export for Vercel
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(
-      `Guess the Bride: http://localhost:${PORT}`
-    );
+    console.log(`Guess the Bride: http://localhost:${PORT}`);
   });
 }
 

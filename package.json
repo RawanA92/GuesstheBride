@@ -1,1 +1,1 @@
-{"name":"guess-the-bride","version":"1.0.0","private":true,"scripts":{"start":"node server.js"},"engines":{"node":">=18"},"dependencies":{"express":"^4.22.3"}}
+{"name":"guess-the-bride","version":"1.0.0","private":true,"scripts":{"start":"node server.js"},"engines":{"node":">=18"},"dependencies":{"@neondatabase/serverless":"^1.2.0","express":"^4.22.3"}}
